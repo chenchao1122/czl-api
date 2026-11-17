@@ -1,0 +1,1624 @@
+diff --git a/CZL-INTEGRATION.md b/CZL-INTEGRATION.md
+new file mode 100644
+index 00000000..f4228fb7
+--- /dev/null
++++ b/CZL-INTEGRATION.md
+@@ -0,0 +1,21 @@
++# CZL 首页与 QS 视频整合候选
++
++本候选以本地 New API 源码 `f1164142` 为底，保留原工作区已有的 521 视频渠道和令牌页面改动。首页使用 GitHub `chenchao1122/czl-api` 提交 `cb9c0ea` 中 11 月 15 日两份备份的差异合并，只导入首页文件与对应中文文案。
++
++QS 修复限定于 `https://qsqs.org` 的 `wan-3.0-per-second`。经渠道模型映射后，网关校验并统一 `seconds` 和 `duration`，缺省为 15 秒，可用范围为 10–30 秒。请求发给上游的时长也是用于本地预扣的时长；余额不足或时长非法时不提交任务，上游立即报告任务失败时退回预扣。任务查询和下载继续使用网关任务 ID。
++
++本地候选使用此版本已有的固定模型单价入口，由 QS 适配器把配置的单价乘以秒数。测试使用模拟上游和隔离数据库，无真实任务费用。两款 W3 Prime 未纳入此次接入。
++
++线上镜像 `czl/new-api:homepage-mobilefix-20261115` 的完整后端没有包含在首页备份里。生产已有独立的 `per_second` 计费入口；直接替换为此早期底座可能丢失后续改动。上线前需在匹配生产的源码里合入 QS 适配并接入原有按秒判断，确认只能乘一次秒数，再做隔离回归与真实短视频验证。
++
++本地复验命令：
++
++```sh
++go test -count=1 ./relay ./relay/channel/task/sora ./relay/common ./setting/ratio_setting ./controller
++cd web
++bun install --frozen-lockfile
++bun run build:check
++bun run test src/features/home src/features/keys src/components/data-table/core src/lib/__tests__/api.test.ts
++```
++
++整合在本地独立分支完成，未修改原工作区、GitHub 仓库或生产服务器。
+diff --git a/controller/qs_video_integration_test.go b/controller/qs_video_integration_test.go
+new file mode 100644
+index 00000000..a5a5bae8
+--- /dev/null
++++ b/controller/qs_video_integration_test.go
+@@ -0,0 +1,106 @@
++package controller
++
++import (
++	"io"
++	"net/http"
++	"net/http/httptest"
++	"strconv"
++	"strings"
++	"testing"
++
++	"github.com/QuantumNous/new-api/common"
++	"github.com/QuantumNous/new-api/constant"
++	taskdto "github.com/QuantumNous/new-api/dto"
++	"github.com/QuantumNous/new-api/model"
++	relayconstant "github.com/QuantumNous/new-api/relay/constant"
++	"github.com/QuantumNous/new-api/service"
++	"github.com/QuantumNous/new-api/setting/system_setting"
++	"github.com/gin-gonic/gin"
++	"github.com/glebarez/sqlite"
++	"github.com/stretchr/testify/assert"
++	"github.com/stretchr/testify/require"
++	"gorm.io/gorm"
++)
++
++type qsControllerTransport func(*http.Request) (*http.Response, error)
++
++func (transport qsControllerTransport) RoundTrip(req *http.Request) (*http.Response, error) {
++	return transport(req)
++}
++
++func TestQSWANFetchAndDownloadUsePublicTaskID(t *testing.T) {
++	db, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{})
++	require.NoError(t, err)
++	rawDB, err := db.DB()
++	require.NoError(t, err)
++	rawDB.SetMaxOpenConns(1)
++	oldDB, oldCache := model.DB, common.MemoryCacheEnabled
++	model.DB, common.MemoryCacheEnabled = db, false
++	t.Cleanup(func() {
++		model.DB, common.MemoryCacheEnabled = oldDB, oldCache
++		assert.NoError(t, rawDB.Close())
++	})
++	require.NoError(t, db.AutoMigrate(&model.Channel{}, &model.Task{}))
++	base := "https://qsqs.org"
++	ch := &model.Channel{Id: 25, Name: "isolated-qs", Type: constant.ChannelTypeOpenAI, BaseURL: &base, Key: "mock-key"}
++	require.NoError(t, db.Create(ch).Error)
++	task := &model.Task{
++		TaskID: "task_local", UserId: 42, ChannelId: ch.Id,
++		Platform: constant.TaskPlatform(strconv.Itoa(ch.Type)), Status: model.TaskStatusSuccess,
++		Properties:  model.Properties{OriginModelName: "wan-3.0-per-second", UpstreamModelName: "wan-3.0-per-second"},
++		PrivateData: model.TaskPrivateData{UpstreamTaskID: "upstream-id"},
++		Data:        []byte(`{"id":"upstream-id","task_id":"upstream-id","status":"completed","video_url":"https://qsqs.org/v1/videos/upstream-id/content"}`),
++	}
++	require.NoError(t, db.Create(task).Error)
++
++	// Keep the test entirely local; the transport below cannot make network requests.
++	fetch := system_setting.GetFetchSetting()
++	originalProtection := fetch.EnableSSRFProtection
++	fetch.EnableSSRFProtection = false
++	if service.GetHttpClient() == nil {
++		service.InitHttpClient()
++	}
++	client := service.GetHttpClient()
++	originalTransport := client.Transport
++	t.Cleanup(func() {
++		client.Transport = originalTransport
++		fetch.EnableSSRFProtection = originalProtection
++	})
++	calls := 0
++	client.Transport = qsControllerTransport(func(req *http.Request) (*http.Response, error) {
++		calls++
++		assert.Equal(t, http.MethodGet, req.Method)
++		assert.Equal(t, "https://qsqs.org/v1/videos/upstream-id/content", req.URL.String())
++		assert.Equal(t, "Bearer mock-key", req.Header.Get("Authorization"))
++		return &http.Response{
++			StatusCode: http.StatusOK,
++			Header:     http.Header{"Content-Type": {"video/mp4"}},
++			Body:       io.NopCloser(strings.NewReader("\x00\x00\x00\x18ftypisom")),
++		}, nil
++	})
++
++	router := gin.New()
++	router.Use(func(c *gin.Context) { c.Set("id", 42); c.Set("relay_mode", relayconstant.RelayModeVideoFetchByID) })
++	router.GET("/v1/videos/:task_id", RelayTaskFetch)
++	router.GET("/v1/videos/:task_id/content", VideoProxy)
++
++	fetched := httptest.NewRecorder()
++	router.ServeHTTP(fetched, httptest.NewRequest(http.MethodGet, "/v1/videos/task_local", nil))
++	require.Equal(t, http.StatusOK, fetched.Code, fetched.Body.String())
++	assert.Contains(t, fetched.Body.String(), "/v1/videos/task_local/content")
++	assert.NotContains(t, fetched.Body.String(), "upstream-id")
++	assert.Zero(t, calls)
++
++	video := httptest.NewRecorder()
++	router.ServeHTTP(video, httptest.NewRequest(http.MethodGet, "/v1/videos/task_local/content", nil))
++	require.Equal(t, http.StatusOK, video.Code, video.Body.String())
++	assert.Equal(t, "video/mp4", video.Header().Get("Content-Type"))
++	assert.Equal(t, "\x00\x00\x00\x18ftypisom", video.Body.String())
++	assert.Equal(t, 1, calls)
++}
++
++func TestQSWANTerminalSubmissionFailureDoesNotRetry(t *testing.T) {
++	c, _ := gin.CreateTestContext(httptest.NewRecorder())
++	err := &taskdto.TaskError{Code: "upstream_video_failed", StatusCode: http.StatusBadGateway}
++	assert.False(t, shouldRetryTaskRelay(c, 25, err, 2))
++}
+diff --git a/controller/relay.go b/controller/relay.go
+index b90dbb70..37d1b9b8 100644
+--- a/controller/relay.go
++++ b/controller/relay.go
+@@ -644,7 +644,8 @@ func respondTaskError(c *gin.Context, taskErr *taskdto.TaskError) {
+ }
+ 
+ func shouldRetryTaskRelay(c *gin.Context, channelId int, taskErr *taskdto.TaskError, retryTimes int) bool {
+-	if taskErr == nil {
++	// QS already acknowledged a terminal video result: retrying could create a second task.
++	if taskErr == nil || taskErr.Code == "upstream_video_failed" {
+ 		return false
+ 	}
+ 	if service.ShouldSkipRetryAfterChannelAffinityFailure(c) {
+diff --git a/relay/channel/task/sora/adaptor.go b/relay/channel/task/sora/adaptor.go
+index 6b53c327..41133a83 100644
+--- a/relay/channel/task/sora/adaptor.go
++++ b/relay/channel/task/sora/adaptor.go
+@@ -38,6 +38,19 @@ type ImageURL struct {
+ 	URL string `json:"url"`
+ }
+ 
++type videoTaskError struct {
++	Message string `json:"message"`
++	Code    string `json:"code"`
++}
++
++func (e *videoTaskError) UnmarshalJSON(data []byte) error {
++	if value := bytes.TrimSpace(data); len(value) > 0 && value[0] == '"' {
++		return common.Unmarshal(value, &e.Message)
++	}
++	type object videoTaskError
++	return common.Unmarshal(data, (*object)(e))
++}
++
+ type responseTask struct {
+ 	ID                 string                 `json:"id"`
+ 	TaskID             string                 `json:"task_id,omitempty"` //兼容旧接口
+@@ -51,10 +64,7 @@ type responseTask struct {
+ 	Seconds            string                 `json:"seconds,omitempty"`
+ 	Size               string                 `json:"size,omitempty"`
+ 	RemixedFromVideoID string                 `json:"remixed_from_video_id,omitempty"`
+-	Error              *struct {
+-		Message string `json:"message"`
+-		Code    string `json:"code"`
+-	} `json:"error,omitempty"`
++	Error              *videoTaskError        `json:"error,omitempty"`
+ 	Metadata           map[string]interface{} `json:"metadata,omitempty"`
+ }
+ 
+@@ -67,9 +77,11 @@ type TaskAdaptor struct {
+ 	ChannelType int
+ 	apiKey      string
+ 	baseURL     string
++	qsRequest   *qsVideoRequest
+ }
+ 
+ func (a *TaskAdaptor) Init(info *relaycommon.RelayInfo) {
++	a.qsRequest = nil
+ 	a.ChannelType = info.ChannelType
+ 	a.baseURL = info.ChannelBaseUrl
+ 	a.apiKey = info.ApiKey
+@@ -119,6 +131,10 @@ func (a *TaskAdaptor) ValidateRequestAndSetAction(c *gin.Context, info *relaycom
+ 
+ // EstimateBilling 根据用户请求的 seconds 和 size 计算 OtherRatios。
+ func (a *TaskAdaptor) EstimateBilling(c *gin.Context, info *relaycommon.RelayInfo) map[string]float64 {
++	if a.qsRequest != nil {
++		return map[string]float64{"seconds": float64(a.qsRequest.seconds)}
++	}
++
+ 	// remix 路径的 OtherRatios 已在 ResolveOriginTask 中设置
+ 	if info.Action == constant.TaskActionRemix {
+ 		return nil
+@@ -170,6 +186,9 @@ func (a *TaskAdaptor) BuildRequestHeader(c *gin.Context, req *http.Request, info
+ }
+ 
+ func (a *TaskAdaptor) BuildRequestBody(c *gin.Context, info *relaycommon.RelayInfo) (io.Reader, error) {
++	if a.qsRequest != nil {
++		return bytes.NewReader(a.qsRequest.body), nil
++	}
+ 	storage, err := common.GetBodyStorage(c)
+ 	if err != nil {
+ 		return nil, errors.Wrap(err, "get_request_body_failed")
+@@ -266,6 +285,14 @@ func (a *TaskAdaptor) DoResponse(c *gin.Context, resp *http.Response, info *rela
+ 		return
+ 	}
+ 
++	if a.qsRequest != nil && (dResp.Status == "failed" || dResp.Status == "cancelled" || dResp.Status == "canceled") {
++		reason := "QS video task failed during submission"
++		if dResp.Error != nil && strings.TrimSpace(dResp.Error.Message) != "" {
++			reason = dResp.Error.Message
++		}
++		return "", nil, service.TaskErrorWrapper(errors.New(reason), "upstream_video_failed", http.StatusBadGateway)
++	}
++
+ 	upstreamID := dResp.ID
+ 	if upstreamID == "" {
+ 		upstreamID = dResp.TaskID
+@@ -330,7 +357,8 @@ func (a *TaskAdaptor) ParseTaskResult(respBody []byte) (*relaycommon.TaskInfo, e
+ 		taskResult.Status = model.TaskStatusInProgress
+ 	case "completed":
+ 		taskResult.Status = model.TaskStatusSuccess
+-		if resTask.Metadata != nil {
++		// QS serves completed content through its auth-protected /content route.
++		if !isQSVideoBase(a.baseURL) && resTask.Metadata != nil {
+ 			for _, key := range []string{"url", "video_url", "download_url", "output_url"} {
+ 				if value, ok := resTask.Metadata[key].(string); ok && strings.TrimSpace(value) != "" {
+ 					taskResult.Url = strings.TrimSpace(value)
+@@ -360,5 +388,14 @@ func (a *TaskAdaptor) ConvertToOpenAIVideo(task *model.Task) ([]byte, error) {
+ 	if data, err = sjson.SetBytes(data, "id", task.TaskID); err != nil {
+ 		return nil, errors.Wrap(err, "set id failed")
+ 	}
++	if task.Properties.UpstreamModelName == qsWanModel {
++		data, err = sjson.SetBytes(data, "task_id", task.TaskID)
++		if err != nil {
++			return nil, err
++		}
++		if task.Status == model.TaskStatusSuccess {
++			return sjson.SetBytes(data, "video_url", taskcommon.BuildProxyURL(task.TaskID))
++		}
++	}
+ 	return data, nil
+ }
+diff --git a/relay/channel/task/sora/qs_video.go b/relay/channel/task/sora/qs_video.go
+new file mode 100644
+index 00000000..2d04531b
+--- /dev/null
++++ b/relay/channel/task/sora/qs_video.go
+@@ -0,0 +1,102 @@
++package sora
++
++import (
++	"bytes"
++	"fmt"
++	"mime"
++	"net/http"
++	"strconv"
++	"strings"
++
++	"github.com/QuantumNous/new-api/common"
++	"github.com/QuantumNous/new-api/constant"
++	"github.com/QuantumNous/new-api/dto"
++	relaycommon "github.com/QuantumNous/new-api/relay/common"
++	"github.com/QuantumNous/new-api/service"
++	"github.com/gin-gonic/gin"
++)
++
++const qsWanModel = "wan-3.0-per-second"
++
++func isQSVideoBase(baseURL string) bool {
++	return strings.TrimRight(baseURL, "/") == "https://qsqs.org"
++}
++
++type qsVideoRequest struct {
++	body    []byte
++	seconds int
++}
++
++// PrepareMappedTask validates the exact outbound duration before preconsumption.
++// Use the same canonical duration in EstimateBilling and BuildRequestBody.
++func (a *TaskAdaptor) PrepareMappedTask(c *gin.Context, info *relaycommon.RelayInfo) *dto.TaskError {
++	if !isQSVideoBase(a.baseURL) || info.UpstreamModelName != qsWanModel {
++		return nil
++	}
++	contentType, _, _ := mime.ParseMediaType(c.GetHeader("Content-Type"))
++	if contentType != "application/json" || info.Action == constant.TaskActionRemix {
++		return service.TaskErrorWrapperLocal(fmt.Errorf("QS WAN requires a JSON video generation request"), "invalid_request", http.StatusBadRequest)
++	}
++
++	var body map[string]qsJSONValue
++	if err := common.UnmarshalBodyReusable(c, &body); err != nil || body == nil {
++		return service.TaskErrorWrapperLocal(fmt.Errorf("QS WAN requires a JSON object"), "invalid_request", http.StatusBadRequest)
++	}
++
++	seconds, err := qsWanDuration(body["seconds"], body["duration"])
++	if err != nil {
++		return service.TaskErrorWrapperLocal(err, "invalid_seconds", http.StatusBadRequest)
++	}
++	body["model"], _ = common.Marshal(qsWanModel)
++	body["seconds"], _ = common.Marshal(strconv.Itoa(seconds))
++	delete(body, "duration")
++	encoded, err := common.Marshal(body)
++	if err != nil {
++		return service.TaskErrorWrapperLocal(err, "invalid_request", http.StatusBadRequest)
++	}
++	a.qsRequest = &qsVideoRequest{body: encoded, seconds: seconds}
++	return nil
++}
++
++// Keep the original JSON representation of fields outside the adapter contract.
++type qsJSONValue []byte
++
++func (v *qsJSONValue) UnmarshalJSON(data []byte) error {
++	*v = append((*v)[:0], data...)
++	return nil
++}
++
++func (v qsJSONValue) MarshalJSON() ([]byte, error) {
++	return []byte(v), nil
++}
++
++func qsWanDuration(seconds, duration qsJSONValue) (int, error) {
++	effective := 0
++	for _, value := range []qsJSONValue{seconds, duration} {
++		value := bytes.TrimSpace(value)
++		if len(value) == 0 || bytes.Equal(value, []byte("null")) {
++			continue
++		}
++		p := string(value)
++		if value[0] == '"' {
++			if err := common.Unmarshal(value, &p); err != nil {
++				return 0, err
++			}
++			if p == "" {
++				continue
++			}
++		}
++		n, err := strconv.ParseUint(p, 10, 8)
++		if err != nil || n < 10 || n > 30 {
++			return 0, fmt.Errorf("QS WAN requires an integer duration between 10 and 30 seconds")
++		}
++		if effective != 0 && effective != int(n) {
++			return 0, fmt.Errorf("seconds and duration must agree")
++		}
++		effective = int(n)
++	}
++	if effective == 0 {
++		effective = 15
++	}
++	return effective, nil
++}
+diff --git a/relay/channel/task/sora/qs_video_test.go b/relay/channel/task/sora/qs_video_test.go
+new file mode 100644
+index 00000000..3a7bbbaf
+--- /dev/null
++++ b/relay/channel/task/sora/qs_video_test.go
+@@ -0,0 +1,91 @@
++package sora
++
++import (
++	"io"
++	"net/http"
++	"net/http/httptest"
++	"strings"
++	"testing"
++
++	"github.com/QuantumNous/new-api/common"
++	"github.com/QuantumNous/new-api/model"
++	relaycommon "github.com/QuantumNous/new-api/relay/common"
++	"github.com/gin-gonic/gin"
++	"github.com/stretchr/testify/assert"
++	"github.com/stretchr/testify/require"
++)
++
++func TestQSWANUsesOneDurationForBillingAndSubmission(t *testing.T) {
++	for _, tc := range []struct {
++		name, fields, seconds string
++	}{
++		{"default", "", "15"},
++		{"min", `,"seconds":10`, "10"},
++		{"max via duration alias", `,"duration":"30"`, "30"},
++		{"agreeing aliases", `,"seconds":"12","duration":12`, "12"},
++	} {
++		t.Run(tc.name, func(t *testing.T) {
++			c, _ := gin.CreateTestContext(httptest.NewRecorder())
++			c.Request = httptest.NewRequest(http.MethodPost, "/v1/videos", strings.NewReader(`{"model":"local-alias","prompt":"test","size":"1792x1024","resolution":"720p","generate_audio":false`+tc.fields+`}`))
++			c.Request.Header.Set("Content-Type", "application/json")
++			defer common.CleanupBodyStorage(c)
++			info := &relaycommon.RelayInfo{TaskRelayInfo: &relaycommon.TaskRelayInfo{}, ChannelMeta: &relaycommon.ChannelMeta{UpstreamModelName: qsWanModel}}
++			a := &TaskAdaptor{baseURL: "https://qsqs.org"}
++			require.Nil(t, a.ValidateRequestAndSetAction(c, info))
++			info.UpstreamModelName = qsWanModel
++			require.Nil(t, a.PrepareMappedTask(c, info))
++			r, err := a.BuildRequestBody(c, info)
++			require.NoError(t, err)
++			b, err := io.ReadAll(r)
++			require.NoError(t, err)
++			var result map[string]any
++			require.NoError(t, common.Unmarshal(b, &result))
++			assert.Equal(t, tc.seconds, result["seconds"])
++			assert.Equal(t, qsWanModel, result["model"])
++			assert.Equal(t, "720p", result["resolution"])
++			assert.Equal(t, false, result["generate_audio"])
++			assert.NotContains(t, result, "duration")
++			var expected float64
++			require.NoError(t, common.UnmarshalJsonStr(tc.seconds, &expected))
++			assert.Equal(t, map[string]float64{"seconds": expected}, a.EstimateBilling(c, info))
++		})
++	}
++}
++
++func TestQSWANRejectsInvalidDurationBeforeBilling(t *testing.T) {
++	for _, fields := range []string{`"seconds":"9"`, `"duration":31`, `"seconds":10,"duration":11`, `"seconds":"abc"`, `"seconds":10.01`, `"seconds":false`, `"seconds":99999999999`} {
++		t.Run(fields, func(t *testing.T) {
++			c, _ := gin.CreateTestContext(httptest.NewRecorder())
++			c.Request = httptest.NewRequest(http.MethodPost, "/v1/videos", strings.NewReader("{"+fields+"}"))
++			c.Request.Header.Set("Content-Type", "application/json")
++			defer common.CleanupBodyStorage(c)
++			a := &TaskAdaptor{baseURL: "https://qsqs.org"}
++			info := &relaycommon.RelayInfo{TaskRelayInfo: &relaycommon.TaskRelayInfo{}, ChannelMeta: &relaycommon.ChannelMeta{UpstreamModelName: qsWanModel}}
++			err := a.PrepareMappedTask(c, info)
++			require.NotNil(t, err)
++			assert.Equal(t, http.StatusBadRequest, err.StatusCode)
++			assert.Equal(t, "invalid_seconds", err.Code)
++		})
++	}
++}
++
++func TestQSWANVideoResultUsesLocalDownloadAndKeepsFailureReason(t *testing.T) {
++	a := &TaskAdaptor{baseURL: "https://qsqs.org"}
++	failed, err := a.ParseTaskResult([]byte(`{"status":"failed","error":"upstream render failed"}`))
++	require.NoError(t, err)
++	assert.Equal(t, string(model.TaskStatusFailure), failed.Status)
++	assert.Equal(t, "upstream render failed", failed.Reason)
++
++	completed := []byte(`{"id":"upstream-private","task_id":"upstream-private","status":"completed","video_url":"https://qsqs.org/v1/videos/upstream-private/content"}`)
++	status, err := a.ParseTaskResult(completed)
++	require.NoError(t, err)
++	assert.Equal(t, string(model.TaskStatusSuccess), status.Status)
++	assert.Empty(t, status.Url)
++
++	task := &model.Task{TaskID: "task_local", Status: model.TaskStatusSuccess, Data: completed}
++	task.Properties.UpstreamModelName = qsWanModel
++	body, err := a.ConvertToOpenAIVideo(task)
++	require.NoError(t, err)
++	assert.NotContains(t, string(body), "upstream-private")
++	assert.Contains(t, string(body), "/v1/videos/task_local/content")
++}
+diff --git a/relay/qs_video_integration_test.go b/relay/qs_video_integration_test.go
+new file mode 100644
+index 00000000..ac38b583
+--- /dev/null
++++ b/relay/qs_video_integration_test.go
+@@ -0,0 +1,166 @@
++package relay
++
++import (
++	"io"
++	"net/http"
++	"net/http/httptest"
++	"strings"
++	"testing"
++	"time"
++
++	"github.com/QuantumNous/new-api/common"
++	"github.com/QuantumNous/new-api/constant"
++	"github.com/QuantumNous/new-api/model"
++	relaycommon "github.com/QuantumNous/new-api/relay/common"
++	"github.com/QuantumNous/new-api/relaykit/dto"
++	"github.com/QuantumNous/new-api/service"
++	"github.com/QuantumNous/new-api/setting/ratio_setting"
++	"github.com/gin-gonic/gin"
++	"github.com/glebarez/sqlite"
++	"github.com/stretchr/testify/assert"
++	"github.com/stretchr/testify/require"
++	"gorm.io/gorm"
++)
++
++type qsTestTransport func(*http.Request) (*http.Response, error)
++
++func (transport qsTestTransport) RoundTrip(req *http.Request) (*http.Response, error) {
++	return transport(req)
++}
++
++func TestQSWANRelaySubmissionAndWallet(t *testing.T) {
++	db, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{})
++	require.NoError(t, err)
++	sqlDB, err := db.DB()
++	require.NoError(t, err)
++	sqlDB.SetMaxOpenConns(1)
++	previousDB := model.DB
++	redisEnabled, batchEnabled := common.RedisEnabled, common.BatchUpdateEnabled
++	model.DB = db
++	common.RedisEnabled, common.BatchUpdateEnabled = false, false
++	t.Cleanup(func() {
++		model.DB = previousDB
++		common.RedisEnabled, common.BatchUpdateEnabled = redisEnabled, batchEnabled
++		assert.NoError(t, sqlDB.Close())
++	})
++	require.NoError(t, db.AutoMigrate(&model.User{}, &model.Token{}))
++
++	previousPrices, err := common.Marshal(ratio_setting.GetModelPriceCopy())
++	require.NoError(t, err)
++	t.Cleanup(func() {
++		assert.NoError(t, ratio_setting.UpdateModelPriceByJSONString(string(previousPrices)))
++	})
++	require.NoError(t, ratio_setting.UpdateModelPriceByJSONString(`{"qs-test-alias":0.24}`))
++	client, err := service.GetHttpClientWithProxy("")
++	require.NoError(t, err)
++	previousTransport := client.Transport
++	t.Cleanup(func() { client.Transport = previousTransport })
++
++	previousGroups, err := common.Marshal(ratio_setting.GetGroupRatioCopy())
++	require.NoError(t, err)
++	t.Cleanup(func() {
++		assert.NoError(t, ratio_setting.UpdateGroupRatioByJSONString(string(previousGroups)))
++	})
++	require.NoError(t, ratio_setting.UpdateGroupRatioByJSONString(`{"qs-test-group":1.25}`))
++
++	for i, tc := range []struct {
++		label, fields, upstreamStatus, outboundSeconds string
++		quota, wallet, token                           int
++		wantError                                      string
++	}{
++		{"default reserves 15 seconds", "", "processing", "15", 2250000, 5000000, 5000000, ""},
++		{"10 seconds reserves exactly once", `,"seconds":"10"`, "processing", "10", 1500000, 5000000, 5000000, ""},
++		{"30 seconds reserves exactly once", `,"duration":30`, "processing", "30", 4500000, 5000000, 5000000, ""},
++		{"invalid duration never reaches upstream", `,"seconds":"9"`, "", "", 0, 5000000, 5000000, "invalid_seconds"},
++		{"insufficient wallet never reaches upstream", `,"seconds":"10"`, "", "", 0, 1000000, 5000000, "insufficient_user_quota"},
++		{"insufficient token never reaches upstream", `,"seconds":"10"`, "", "", 0, 5000000, 1000000, "pre_consume_token_quota_failed"},
++		{"terminal failure refunds the full reserve", `,"seconds":"10"`, "failed", "10", 1500000, 5000000, 5000000, "upstream_video_failed"},
++	} {
++		t.Run(tc.label, func(t *testing.T) {
++			user := model.User{Id: i + 1, Username: "qs-wallet-" + string(rune('a'+i)), Quota: tc.wallet, Status: common.UserStatusEnabled, AffCode: string(rune(97 + i))}
++			token := model.Token{Id: i + 1, UserId: user.Id, Key: "qs-token-" + string(rune('a'+i)), RemainQuota: tc.token, Status: common.TokenStatusEnabled}
++			require.NoError(t, db.Create(&user).Error)
++			require.NoError(t, db.Create(&token).Error)
++			calls := 0
++			balances := func() (int, int) {
++				var u model.User
++				var k model.Token
++				require.NoError(t, db.First(&u, user.Id).Error)
++				require.NoError(t, db.First(&k, token.Id).Error)
++				return u.Quota, k.RemainQuota
++			}
++
++			client.Transport = qsTestTransport(func(req *http.Request) (*http.Response, error) {
++				calls++
++				assert.Equal(t, "https://qsqs.org/v1/videos", req.URL.String())
++				assert.Equal(t, "Bearer isolated-upstream-key", req.Header.Get("Authorization"))
++				payload, readErr := io.ReadAll(req.Body)
++				require.NoError(t, readErr)
++				var body map[string]any
++				require.NoError(t, common.Unmarshal(payload, &body))
++				assert.Equal(t, "wan-3.0-per-second", body["model"])
++				assert.Equal(t, tc.outboundSeconds, body["seconds"])
++				assert.NotContains(t, body, "duration")
++				w, k := balances()
++				assert.Equal(t, tc.wallet-tc.quota, w, "wallet before sending")
++				assert.Equal(t, tc.token-tc.quota, k, "token before sending")
++				resp := `{"id":"qs-upstream-private","status":"` + tc.upstreamStatus + `"}`
++				if tc.upstreamStatus == "failed" {
++					resp = `{"id":"qs-upstream-private","status":"failed","error":"render rejected"}`
++				}
++				return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(resp)), Header: make(http.Header)}, nil
++			})
++
++			rec := httptest.NewRecorder()
++			c, _ := gin.CreateTestContext(rec)
++			c.Request = httptest.NewRequest(http.MethodPost, "/v1/videos", strings.NewReader(`{"model":"qs-test-alias","prompt":"paper boat"`+tc.fields+`}`))
++			c.Request.Header.Set("Content-Type", "application/json")
++			t.Cleanup(func() { common.CleanupBodyStorage(c) })
++			common.SetContextKey(c, constant.ContextKeyChannelType, constant.ChannelTypeOpenAI)
++			common.SetContextKey(c, constant.ContextKeyChannelBaseUrl, "https://qsqs.org")
++			common.SetContextKey(c, constant.ContextKeyChannelKey, "isolated-upstream-key")
++			c.Set("model_mapping", `{"qs-test-alias":"wan-3.0-per-second"}`)
++			info := &relaycommon.RelayInfo{
++				UserId: user.Id, TokenId: token.Id, TokenKey: token.Key,
++				UsingGroup: "qs-test-group", UserGroup: "default", OriginModelName: "qs-test-alias",
++				UserSetting:   dto.UserSetting{BillingPreference: "wallet_only"},
++				TaskRelayInfo: &relaycommon.TaskRelayInfo{},
++			}
++			result, taskErr := RelayTaskSubmit(c, info)
++			if tc.wantError == "" {
++				require.Nil(t, taskErr)
++				require.NotNil(t, result)
++				assert.Equal(t, tc.quota, result.Quota)
++				assert.Equal(t, 1, calls)
++				assert.Equal(t, "qs-upstream-private", result.UpstreamTaskID)
++				assert.NotContains(t, rec.Body.String(), result.UpstreamTaskID)
++				require.NoError(t, service.SettleBilling(c, info, result.Quota))
++			} else {
++				require.NotNil(t, taskErr)
++				assert.Equal(t, tc.wantError, taskErr.Code)
++				assert.Nil(t, result)
++				if tc.upstreamStatus == "failed" {
++					assert.Equal(t, 1, calls)
++					assert.Equal(t, "render rejected", taskErr.Message)
++					// Exercise the same billing refund the controller invokes on a submit error.
++					require.NotNil(t, info.Billing)
++					info.Billing.Refund(c)
++					require.Eventually(t, func() bool {
++						w, k := balances()
++						return w == tc.wallet && k == tc.token
++					}, time.Second, 5*time.Millisecond)
++				} else {
++					assert.Zero(t, calls)
++				}
++			}
++			w, k := balances()
++			if tc.wantError == "" {
++				assert.Equal(t, tc.wallet-tc.quota, w)
++				assert.Equal(t, tc.token-tc.quota, k)
++			} else {
++				assert.Equal(t, tc.wallet, w)
++				assert.Equal(t, tc.token, k)
++			}
++		})
++	}
++}
+diff --git a/relay/relay_task.go b/relay/relay_task.go
+index fb384d18..46b68bd8 100644
+--- a/relay/relay_task.go
++++ b/relay/relay_task.go
+@@ -172,6 +172,14 @@ func RelayTaskSubmit(c *gin.Context, info *relaycommon.RelayInfo) (*TaskSubmitRe
+ 		return nil, service.TaskErrorWrapperLocal(err, "model_mapping_failed", http.StatusBadRequest)
+ 	}
+ 
++	if preparer, ok := adaptor.(interface {
++		PrepareMappedTask(*gin.Context, *relaycommon.RelayInfo) *dto.TaskError
++	}); ok {
++		if taskErr := preparer.PrepareMappedTask(c, info); taskErr != nil {
++			return nil, taskErr
++		}
++	}
++
+ 	// 3. 预生成公开 task ID（仅首次）
+ 	if info.PublicTaskID == "" {
+ 		info.PublicTaskID = model.GenerateTaskID()
+diff --git a/web/src/features/home/__tests__/featured-models.test.ts b/web/src/features/home/__tests__/featured-models.test.ts
+new file mode 100644
+index 00000000..893579b9
+--- /dev/null
++++ b/web/src/features/home/__tests__/featured-models.test.ts
+@@ -0,0 +1,66 @@
++/*
++Copyright (C) 2023-2026 QuantumNous
++
++This program is free software: you can redistribute it and/or modify
++it under the terms of the GNU Affero General Public License as
++published by the Free Software Foundation, either version 3 of the
++License, or (at your option) any later version.
++
++This program is distributed in the hope that it will be useful,
++but WITHOUT ANY WARRANTY; without even the implied warranty of
++MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
++GNU Affero General Public License for more details.
++
++You should have received a copy of the GNU Affero General Public License
++along with this program. If not, see <https://www.gnu.org/licenses/>.
++
++For commercial licensing, please contact support@quantumnous.com
++*/
++import { describe, expect, it } from 'vitest'
++
++import type { PricingModel } from '@/features/pricing/types'
++
++import { selectFeaturedModels } from '../lib/featured-models'
++
++function model(modelName: string): PricingModel {
++  return {
++    id: modelName.length,
++    model_name: modelName,
++    quota_type: 1,
++    model_ratio: 1,
++    completion_ratio: 1,
++    enable_groups: [],
++  }
++}
++
++describe('selectFeaturedModels', () => {
++  it('prioritizes the configured video, image, and text showcase models', () => {
++    const result = selectFeaturedModels([
++      model('gpt-4o-mini'),
++      model('gpt-image-2'),
++      model('SD-fast-720'),
++      model('Seedream 5 Pro'),
++    ])
++
++    expect(result.map((item) => item.model_name)).toEqual([
++      'SD-fast-720',
++      'Seedream 5 Pro',
++      'gpt-image-2',
++    ])
++  })
++
++  it('fills missing showcase models with unique live catalog entries', () => {
++    const result = selectFeaturedModels([
++      model('SD-fast-720'),
++      model('chat-model'),
++      model('image-model'),
++      model('extra-model'),
++    ])
++
++    expect(result.map((item) => item.model_name)).toEqual([
++      'SD-fast-720',
++      'chat-model',
++      'image-model',
++    ])
++  })
++})
+diff --git a/web/src/features/home/components/hero-terminal-demo.tsx b/web/src/features/home/components/hero-terminal-demo.tsx
+index 2b4651a2..c77d04ff 100644
+--- a/web/src/features/home/components/hero-terminal-demo.tsx
++++ b/web/src/features/home/components/hero-terminal-demo.tsx
+@@ -32,7 +32,6 @@ interface ApiDemoConfig {
+   response: string[]
+   responseHighlights: string[]
+   tokens: number
+-  latency: number
+   accent: AccentTone
+ }
+ 
+@@ -91,72 +90,49 @@ const API_DEMOS: ApiDemoConfig[] = [
+     ],
+     responseHighlights: ['<text>', '<tokens>'],
+     tokens: 27,
+-    latency: 142,
+     accent: 'emerald',
+   },
+   {
+-    id: 'responses',
+-    label: 'Responses',
++    id: 'image',
++    label: 'Image',
+     method: 'POST',
+-    endpoint: '/v1/responses',
++    endpoint: '/v1/images/generations',
+     headers: ['"Authorization: Bearer sk-••••"'],
+-    request: ['"model": "your-model",', '"input": "..."'],
+-    response: [
+-      '{',
+-      '  "output": [{ "type": "output_text", "text": <text> }],',
+-      '  "usage": { "total_tokens": <tokens> }',
+-      '}',
+-    ],
+-    responseHighlights: ['<text>', '<tokens>'],
+-    tokens: 31,
+-    latency: 168,
+-    accent: 'amber',
+-  },
+-  {
+-    id: 'claude',
+-    label: 'Claude',
+-    method: 'POST',
+-    endpoint: '/v1/messages',
+-    headers: ['"x-api-key: sk-••••"', '"anthropic-version: 2023-06-01"'],
+     request: [
+-      '"model": "your-model",',
+-      '"max_tokens": 1024,',
+-      '"messages": [',
+-      '  { "role": "user", "content": "..." }',
+-      ']',
++      '"model": "gpt-image-2",',
++      '"prompt": "A red lantern...",',
++      '"size": "1024x1024"',
+     ],
+     response: [
+       '{',
+-      '  "content": [{ "type": "text", "text": <text> }],',
+-      '  "usage": { "input_tokens": <in>, "output_tokens": <out> }',
++      '  "created": 1792677386,',
++      '  "data": [{ "url": "https://..." }]',
+       '}',
+     ],
+-    responseHighlights: ['<text>', '<in>', '<out>'],
+-    tokens: 29,
+-    latency: 156,
+-    accent: 'blue',
++    responseHighlights: [],
++    tokens: 0,
++    accent: 'amber',
+   },
+   {
+-    id: 'gemini',
+-    label: 'Gemini',
++    id: 'video',
++    label: 'Video',
+     method: 'POST',
+-    endpoint: '/v1beta/models/{model}:generateContent',
+-    headers: ['"x-goog-api-key: sk-••••"'],
++    endpoint: '/v1/videos',
++    headers: ['"Authorization: Bearer sk-••••"'],
+     request: [
+-      '"contents": [',
+-      '  { "role": "user",',
+-      '    "parts": [{ "text": "..." }] }',
+-      ']',
++      '"model": "SD-fast-720",',
++      '"prompt": "A red lantern in the rain...",',
++      '"seconds": "4"',
+     ],
+     response: [
+       '{',
+-      '  "candidates": [{ "content": { "parts": [{ "text": <text> }] } }],',
+-      '  "usageMetadata": { "totalTokenCount": <tokens> }',
++      '  "id": "task_xxxxxxxx",',
++      '  "status": "queued",',
++      '  "seconds": 4',
+       '}',
+     ],
+-    responseHighlights: ['<text>', '<tokens>'],
+-    tokens: 25,
+-    latency: 93,
++    responseHighlights: [],
++    tokens: 0,
+     accent: 'violet',
+   },
+ ]
+@@ -169,7 +145,9 @@ interface HeroTerminalDemoProps {
+ }
+ 
+ export function HeroTerminalDemo(props: HeroTerminalDemoProps) {
+-  const [activeIndex, setActiveIndex] = useState(0)
++  const [activeIndex, setActiveIndex] = useState(
++    API_DEMOS.findIndex((demo) => demo.id === 'video')
++  )
+   const [transitioning, setTransitioning] = useState(false)
+   const intervalRef = useRef<ReturnType<typeof setInterval>>(undefined)
+   const timeoutRef = useRef<ReturnType<typeof setTimeout>>(undefined)
+@@ -217,8 +195,10 @@ export function HeroTerminalDemo(props: HeroTerminalDemoProps) {
+       >
+         {/* Tab strip */}
+         <div
++          role='tablist'
++          aria-label='API examples'
+           className={cn(
+-            'flex items-center gap-1 border-b px-2 sm:gap-1.5 sm:px-3',
++            'flex items-center gap-0.5 border-b px-2 sm:gap-1.5 sm:px-3',
+             'border-border/50 dark:border-white/[0.05]'
+           )}
+         >
+@@ -228,9 +208,12 @@ export function HeroTerminalDemo(props: HeroTerminalDemoProps) {
+             return (
+               <button
+                 key={item.id}
++                type='button'
++                role='tab'
++                aria-selected={isActive}
+                 onClick={() => handleSelect(index)}
+                 className={cn(
+-                  'relative -mb-px flex items-center gap-1.5 border-b-2 px-2.5 py-2.5 text-[11px] font-medium tracking-wide transition-colors sm:px-3 sm:text-xs',
++                  'relative -mb-px flex min-w-0 items-center gap-1.5 border-b-2 px-2 py-2.5 text-[11px] font-medium tracking-wide transition-colors sm:px-3 sm:text-xs',
+                   isActive
+                     ? `${tone.activeBorder} ${tone.activeText}`
+                     : 'text-foreground/40 hover:text-foreground/70 border-transparent'
+@@ -240,10 +223,10 @@ export function HeroTerminalDemo(props: HeroTerminalDemoProps) {
+               </button>
+             )
+           })}
+-          <div className='ml-auto flex items-center gap-2 pr-2 sm:pr-3'>
+-            <span className='inline-block size-1.5 rounded-full bg-emerald-500 shadow-[0_0_8px_rgba(16,185,129,0.45)]' />
++          <div className='ml-auto flex shrink-0 items-center gap-2 pr-2 sm:pr-3'>
++            <span className='inline-block size-1.5 rounded-full bg-amber-500' />
+             <span className='text-foreground/40 font-mono text-[10px] tracking-wider uppercase'>
+-              200 ok
++              example
+             </span>
+           </div>
+         </div>
+@@ -274,7 +257,7 @@ export function HeroTerminalDemo(props: HeroTerminalDemoProps) {
+         </div>
+ 
+         {/* Body — fixed rows so neither block shifts when switching demos */}
+-        <div className='grid h-[400px] grid-rows-[235px_minmax(0,1fr)] font-mono text-[12.5px] leading-[1.55]'>
++        <div className='grid h-[350px] grid-rows-[190px_minmax(0,1fr)] font-mono text-[11px] leading-[1.55] sm:text-[12px]'>
+           {/* Request */}
+           <RequestBlock demo={demo} transitioning={transitioning} />
+ 
+@@ -282,33 +265,20 @@ export function HeroTerminalDemo(props: HeroTerminalDemoProps) {
+           <ResponseBlock demo={demo} transitioning={transitioning} />
+         </div>
+ 
+-        {/* Footer metrics */}
++        {/* Example metadata */}
+         <div
+           className={cn(
+             'flex items-center justify-between border-t px-5 py-2.5',
+             'border-border/40 bg-muted/30 dark:border-white/[0.05] dark:bg-white/[0.02]'
+           )}
+         >
+-          <div className='text-foreground/40 flex items-center gap-3 text-[10px] tabular-nums'>
+-            <span className='flex items-center gap-1'>
+-              <span className='font-mono'>{demo.latency}</span>
+-              <span className='tracking-wider uppercase'>ms</span>
+-            </span>
+-            <span className='bg-foreground/15 size-1 rounded-full' />
+-            <span className='flex items-center gap-1'>
+-              <span className='font-mono'>{demo.tokens}</span>
+-              <span className='tracking-wider uppercase'>tokens</span>
+-            </span>
+-            <span className='bg-foreground/15 size-1 rounded-full' />
+-            <span className='flex items-center gap-1'>
+-              <span className='tracking-wider uppercase'>cost</span>
+-              <span className='font-mono'>
+-                ${(demo.tokens * 0.00003).toFixed(5)}
+-              </span>
+-            </span>
++          <div className='text-foreground/40 flex min-w-0 items-center gap-2 text-[10px] tabular-nums'>
++            <span className='tracking-wider uppercase'>API example</span>
++            <span className='bg-foreground/15 size-1 shrink-0 rounded-full' />
++            <code className='truncate font-mono'>{demo.endpoint}</code>
+           </div>
+           <span className='text-foreground/30 font-mono text-[10px] tracking-wider uppercase'>
+-            stream · sse
++            json
+           </span>
+         </div>
+       </div>
+@@ -342,8 +312,8 @@ function RequestBlock(props: { demo: ApiDemoConfig; transitioning: boolean }) {
+         <CodeLine indent={2}>
+           <Flag>-d</Flag> <StringText>&apos;{'{'}</StringText>
+         </CodeLine>
+-        {demo.request.map((line, i) => (
+-          <CodeLine key={i} indent={4}>
++        {demo.request.map((line) => (
++          <CodeLine key={line} indent={4}>
+             {renderJsonLine(line)}
+           </CodeLine>
+         ))}
+@@ -372,8 +342,8 @@ function ResponseBlock(props: { demo: ApiDemoConfig; transitioning: boolean }) {
+           transitioning ? 'opacity-0' : 'opacity-100'
+         )}
+       >
+-        {demo.response.map((line, i) => (
+-          <CodeLine key={i}>{renderResponseLine(line, demo)}</CodeLine>
++        {demo.response.map((line) => (
++          <CodeLine key={line}>{renderResponseLine(line, demo)}</CodeLine>
+         ))}
+       </div>
+     </div>
+@@ -405,36 +375,36 @@ function renderResponseLine(line: string, demo: ApiDemoConfig): ReactNode {
+ 
+   if (matches.length === 0) return tokenize(line)
+ 
+-  matches.forEach((match, idx) => {
++  matches.forEach((match) => {
+     const start = match.index ?? 0
+     if (start > cursor) {
+       segments.push(
+-        <span key={`pre-${idx}`}>{tokenize(line.slice(cursor, start))}</span>
++        <span key={`pre-${start}`}>{tokenize(line.slice(cursor, start))}</span>
+       )
+     }
+     const placeholder = match[0]
+     if (placeholder === '<text>') {
+       segments.push(
+-        <Accent key={`ph-${idx}`} accent={demo.accent}>
++        <Accent key={`ph-${start}`} accent={demo.accent}>
+           {`"${truncateResponse(demo)}"`}
+         </Accent>
+       )
+     } else if (placeholder === '<tokens>') {
+-      segments.push(<NumberText key={`ph-${idx}`}>{demo.tokens}</NumberText>)
++      segments.push(<NumberText key={`ph-${start}`}>{demo.tokens}</NumberText>)
+     } else if (placeholder === '<in>') {
+       segments.push(
+-        <NumberText key={`ph-${idx}`}>
++        <NumberText key={`ph-${start}`}>
+           {Math.floor(demo.tokens * 0.4)}
+         </NumberText>
+       )
+     } else if (placeholder === '<out>') {
+       segments.push(
+-        <NumberText key={`ph-${idx}`}>
++        <NumberText key={`ph-${start}`}>
+           {Math.ceil(demo.tokens * 0.6)}
+         </NumberText>
+       )
+     } else {
+-      segments.push(<Muted key={`ph-${idx}`}>{placeholder}</Muted>)
++      segments.push(<Muted key={`ph-${start}`}>{placeholder}</Muted>)
+     }
+     cursor = start + placeholder.length
+   })
+@@ -449,9 +419,7 @@ function renderResponseLine(line: string, demo: ApiDemoConfig): ReactNode {
+ function truncateResponse(demo: ApiDemoConfig): string {
+   const map: Record<string, string> = {
+     'gpt-chat': 'Chat request routed.',
+-    responses: 'Response workflow ready.',
+-    claude: 'Claude message routed.',
+-    gemini: 'Gemini request served.',
++    image: 'Image generated.',
+   }
+   return map[demo.id] ?? '...'
+ }
+@@ -462,20 +430,20 @@ function tokenize(input: string): ReactNode {
+   let cursor = 0
+   const matches = [...input.matchAll(STRING_RE)]
+ 
+-  matches.forEach((match, idx) => {
++  matches.forEach((match) => {
+     const start = match.index ?? 0
+     if (start > cursor) {
+       segments.push(
+-        <Muted key={`m-${idx}`}>{input.slice(cursor, start)}</Muted>
++        <Muted key={`m-${start}`}>{input.slice(cursor, start)}</Muted>
+       )
+     }
+     const text = match[0]
+     const after = input.slice(start + text.length).trimStart()
+     const isKey = after.startsWith(':')
+     if (isKey) {
+-      segments.push(<Key key={`k-${idx}`}>{text}</Key>)
++      segments.push(<Key key={`k-${start}`}>{text}</Key>)
+     } else {
+-      segments.push(<StringText key={`s-${idx}`}>{text}</StringText>)
++      segments.push(<StringText key={`s-${start}`}>{text}</StringText>)
+     }
+     cursor = start + text.length
+   })
+diff --git a/web/src/features/home/components/index.ts b/web/src/features/home/components/index.ts
+index 56e67a16..bf5f72f6 100644
+--- a/web/src/features/home/components/index.ts
++++ b/web/src/features/home/components/index.ts
+@@ -17,6 +17,7 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
+ For commercial licensing, please contact support@quantumnous.com
+ */
+ export { CTA } from './sections/cta'
++export { FeaturedModels } from './sections/featured-models'
+ export { Features } from './sections/features'
+ export { Hero } from './sections/hero'
+ export { HowItWorks } from './sections/how-it-works'
+diff --git a/web/src/features/home/components/sections/featured-models.tsx b/web/src/features/home/components/sections/featured-models.tsx
+new file mode 100644
+index 00000000..fd9f53ee
+--- /dev/null
++++ b/web/src/features/home/components/sections/featured-models.tsx
+@@ -0,0 +1,108 @@
++/*
++Copyright (C) 2023-2026 QuantumNous
++
++This program is free software: you can redistribute it and/or modify
++it under the terms of the GNU Affero General Public License as
++published by the Free Software Foundation, either version 3 of the
++License, or (at your option) any later version.
++
++This program is distributed in the hope that it will be useful,
++but WITHOUT ANY WARRANTY; without even the implied warranty of
++MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
++GNU Affero General Public License for more details.
++
++You should have received a copy of the GNU Affero General Public License
++along with this program. If not, see <https://www.gnu.org/licenses/>.
++
++For commercial licensing, please contact support@quantumnous.com
++*/
++import { Link } from '@tanstack/react-router'
++import { ArrowRight } from 'lucide-react'
++import { useMemo } from 'react'
++import { useTranslation } from 'react-i18next'
++
++import { AnimateInView } from '@/components/animate-in-view'
++import { Button } from '@/components/ui/button'
++import { ModelBillingModeBadge } from '@/features/pricing/components/model-billing-mode-badge'
++import { usePricingData } from '@/features/pricing/hooks/use-pricing-data'
++import { formatPrice, formatRequestPrice } from '@/features/pricing/lib/price'
++import type { PricingModel } from '@/features/pricing/types'
++
++import { selectFeaturedModels } from '../../lib/featured-models'
++
++function getModelPrice(
++  model: PricingModel,
++  priceRate: number,
++  usdExchangeRate: number,
++  t: ReturnType<typeof useTranslation>['t']
++): string {
++  if (model.billing_mode === 'tiered_expr') return t('Dynamic Pricing')
++
++  if (model.quota_type === 1) {
++    const unit = model.billing_mode === 'per_second' ? 'second' : 'request'
++    return `${formatRequestPrice(model, false, priceRate, usdExchangeRate)} / ${t(unit)}`
++  }
++
++  return `${formatPrice(model, 'input', 'M', false, priceRate, usdExchangeRate)} / 1M ${t('tokens')}`
++}
++
++export function FeaturedModels() {
++  const { t } = useTranslation()
++  const { models, isLoading, priceRate, usdExchangeRate } = usePricingData()
++  const featuredModels = useMemo(() => selectFeaturedModels(models), [models])
++
++  if (isLoading || featuredModels.length === 0) return null
++
++  return (
++    <section className='border-border/40 relative z-10 border-y px-6 py-14 md:py-16'>
++      <div className='mx-auto max-w-6xl'>
++        <div className='mb-6 flex flex-wrap items-end justify-between gap-4'>
++          <div className='max-w-2xl'>
++            <p className='text-muted-foreground mb-2 text-xs font-medium tracking-widest uppercase'>
++              {t('Model Square')}
++            </p>
++            <h2 className='text-xl font-bold tracking-tight md:text-2xl'>
++              {t('Available Models')}
++            </h2>
++          </div>
++          <Button
++            variant='outline'
++            className='group h-9 rounded-lg px-3 text-sm'
++            render={<Link to='/pricing' />}
++          >
++            {t('Model Square')}
++            <ArrowRight className='ml-1.5 size-4 transition-transform group-hover:translate-x-0.5' />
++          </Button>
++        </div>
++
++        <div className='grid gap-3 md:grid-cols-3'>
++          {featuredModels.map((model, index) => (
++            <AnimateInView key={model.model_name} delay={index * 80}>
++              <Link
++                to='/pricing'
++                className='border-border/60 bg-background hover:bg-muted/20 block h-full rounded-lg border p-4 transition-colors'
++              >
++                <div className='flex min-w-0 items-start justify-between gap-3'>
++                  <h3 className='text-foreground min-w-0 font-mono text-sm font-semibold break-all'>
++                    {model.model_name}
++                  </h3>
++                  {model.vendor_name ? (
++                    <span className='text-muted-foreground shrink-0 text-xs'>
++                      {model.vendor_name}
++                    </span>
++                  ) : null}
++                </div>
++                <div className='text-muted-foreground mt-3 flex flex-wrap items-center gap-2 text-sm'>
++                  <span className='text-foreground font-mono font-semibold'>
++                    {getModelPrice(model, priceRate, usdExchangeRate, t)}
++                  </span>
++                  <ModelBillingModeBadge model={model} />
++                </div>
++              </Link>
++            </AnimateInView>
++          ))}
++        </div>
++      </div>
++    </section>
++  )
++}
+diff --git a/web/src/features/home/components/sections/features.tsx b/web/src/features/home/components/sections/features.tsx
+index 79ea703a..e76dec7f 100644
+--- a/web/src/features/home/components/sections/features.tsx
++++ b/web/src/features/home/components/sections/features.tsx
+@@ -17,14 +17,13 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
+ For commercial licensing, please contact support@quantumnous.com
+ */
+ import {
+-  Zap,
+-  Shield,
+-  Globe,
++  BarChart3,
+   Code,
+-  Gauge,
+   DollarSign,
+-  Users,
++  Gauge,
+   HeartHandshake,
++  Tags,
++  Users,
+ } from 'lucide-react'
+ import { useTranslation } from 'react-i18next'
+ 
+@@ -39,21 +38,19 @@ export function Features(_props: FeaturesProps) {
+ 
+   const features = [
+     {
+-      id: 'fast',
++      id: 'developer',
+       num: '01',
+-      title: t('Lightning Fast'),
+-      desc: t(
+-        'Optimized network architecture ensures millisecond response times'
+-      ),
++      title: t('Developer Friendly'),
++      desc: t('Compatible API routes for common AI application workflows'),
+       span: 'md:col-span-2',
+-      icon: <Zap className='size-4 text-blue-400' />,
++      icon: <Code className='size-4 text-rose-500' />,
+       visual: (
+         <div className='mt-4 grid grid-cols-3 gap-2'>
+           {['OpenAI', 'Claude', 'Gemini', 'DeepSeek', 'Qwen', 'Llama'].map(
+             (name) => (
+               <div
+                 key={name}
+-                className='border-border/30 bg-muted/20 text-muted-foreground flex items-center justify-center rounded-lg border px-3 py-2 text-xs transition-colors duration-300 hover:border-blue-500/30 hover:bg-blue-500/5'
++                className='border-border/30 bg-muted/20 text-muted-foreground flex items-center justify-center rounded-lg border px-3 py-2 text-xs transition-colors duration-300 hover:border-rose-500/30 hover:bg-rose-500/5'
+               >
+                 {name}
+               </div>
+@@ -63,78 +60,61 @@ export function Features(_props: FeaturesProps) {
+       ),
+     },
+     {
+-      id: 'secure',
++      id: 'catalog',
+       num: '02',
+-      title: t('Secure & Reliable'),
++      title: t('Model Square'),
+       desc: t(
+-        'Enterprise-grade security with comprehensive permission management'
++        'Discover curated AI models, compare pricing and capabilities, and choose the right model for every scenario.'
+       ),
+       span: 'md:col-span-1',
+-      icon: <Shield className='size-4 text-emerald-400' />,
++      icon: <Tags className='size-4 text-emerald-500' />,
+       visual: (
+-        <div className='mt-4 flex items-center justify-center'>
+-          <div className='relative'>
+-            <div className='flex size-16 items-center justify-center rounded-2xl border border-emerald-500/20 bg-emerald-500/5'>
+-              <Shield
+-                className='size-7 text-emerald-500/70'
+-                strokeWidth={1.5}
+-              />
+-            </div>
+-            <div className='absolute -top-1 -right-1 flex size-4 items-center justify-center rounded-full bg-emerald-500'>
+-              <svg
+-                className='size-2.5 text-white'
+-                fill='none'
+-                viewBox='0 0 24 24'
+-                stroke='currentColor'
+-                strokeWidth={3}
+-              >
+-                <path
+-                  strokeLinecap='round'
+-                  strokeLinejoin='round'
+-                  d='m4.5 12.75 6 6 9-13.5'
+-                />
+-              </svg>
++        <div className='mt-4 grid grid-cols-3 gap-2'>
++          {['Text', 'Image', 'Video'].map((modality) => (
++            <div
++              key={modality}
++              className='border-border/30 bg-muted/20 text-muted-foreground flex items-center justify-center rounded-lg border px-2 py-2 text-xs'
++            >
++              {t(modality)}
+             </div>
+-          </div>
++          ))}
+         </div>
+       ),
+     },
+     {
+-      id: 'global',
++      id: 'billing',
+       num: '03',
+-      title: t('Global Coverage'),
+-      desc: t('Multi-region deployment for stable global access'),
++      title: t('Transparent Billing'),
++      desc: t('Pay-as-you-go with real-time usage monitoring'),
+       span: 'md:col-span-1',
+-      icon: <Globe className='size-4 text-violet-400' />,
++      icon: <DollarSign className='size-4 text-amber-500' />,
+       visual: (
+         <div className='mt-4 space-y-2'>
+-          {[t('Load Balancing'), t('Rate Limiting'), t('Cost Tracking')].map(
+-            (step, i) => (
+-              <div key={step} className='flex items-center gap-2'>
+-                <div
+-                  className={`flex size-6 items-center justify-center rounded-full text-[10px] font-bold ${
+-                    i === 1
+-                      ? 'border border-blue-500/30 bg-blue-500/20 text-blue-500'
+-                      : 'border-border/40 bg-muted text-muted-foreground border'
+-                  }`}
+-                >
+-                  {i + 1}
+-                </div>
+-                <div className='bg-border/40 h-px flex-1' />
+-                <span className='text-muted-foreground text-xs'>{step}</span>
++          {[t('Tokens'), t('request'), t('second')].map((unit, i) => (
++            <div key={unit} className='flex items-center gap-2'>
++              <div
++                className={`flex size-6 items-center justify-center rounded-full text-[10px] font-bold ${
++                  i === 1
++                    ? 'border border-rose-500/30 bg-rose-500/10 text-rose-600 dark:text-rose-400'
++                    : 'border-border/40 bg-muted text-muted-foreground border'
++                }`}
++              >
++                {i + 1}
+               </div>
+-            )
+-          )}
++              <div className='bg-border/40 h-px flex-1' />
++              <span className='text-muted-foreground text-xs'>{unit}</span>
++            </div>
++          ))}
+         </div>
+       ),
+     },
+     {
+-      id: 'developer',
++      id: 'usage',
+       num: '04',
+-      title: t('Developer Friendly'),
+-      desc: t('Compatible API routes for common AI application workflows'),
++      title: t('Usage Logs'),
++      desc: t('Track usage, costs and performance with real-time analytics'),
+       span: 'md:col-span-2',
+-      icon: <Code className='size-4 text-amber-400' />,
++      icon: <BarChart3 className='size-4 text-blue-500' />,
+       visual: (
+         <div className='mt-4 flex items-center gap-3'>
+           <div className='flex -space-x-2'>
+@@ -148,7 +128,7 @@ export function Features(_props: FeaturesProps) {
+             ))}
+           </div>
+           <div className='text-muted-foreground flex items-center gap-1.5 text-xs'>
+-            <Code className='size-3.5 text-blue-500' />
++            <Code className='size-3.5 text-rose-500' />
+             {t('Multi-protocol Compatible')}
+           </div>
+         </div>
+diff --git a/web/src/features/home/components/sections/hero.tsx b/web/src/features/home/components/sections/hero.tsx
+index 4a08151a..8442ce2f 100644
+--- a/web/src/features/home/components/sections/hero.tsx
++++ b/web/src/features/home/components/sections/hero.tsx
+@@ -87,9 +87,9 @@ export function Hero(props: HeroProps) {
+         className='pointer-events-none absolute inset-0 -z-10 opacity-25 dark:opacity-[0.12]'
+         style={{
+           background: [
+-            'radial-gradient(ellipse 60% 50% at 20% 20%, oklch(0.72 0.18 250 / 80%) 0%, transparent 70%)',
+-            'radial-gradient(ellipse 50% 40% at 80% 15%, oklch(0.65 0.15 200 / 60%) 0%, transparent 70%)',
+-            'radial-gradient(ellipse 40% 35% at 40% 80%, oklch(0.70 0.12 280 / 40%) 0%, transparent 70%)',
++            'radial-gradient(ellipse 60% 50% at 20% 20%, oklch(0.82 0.12 20 / 70%) 0%, transparent 70%)',
++            'radial-gradient(ellipse 50% 40% at 80% 15%, oklch(0.84 0.10 80 / 50%) 0%, transparent 70%)',
++            'radial-gradient(ellipse 40% 35% at 40% 80%, oklch(0.78 0.09 145 / 25%) 0%, transparent 70%)',
+           ].join(', '),
+         }}
+       />
+@@ -104,23 +104,23 @@ export function Hero(props: HeroProps) {
+         <div className='flex flex-col items-start text-left lg:col-span-6'>
+           {/* Top Pill Badge */}
+           <div
+-            className='landing-animate-fade-up mb-5 inline-flex items-center gap-1.5 rounded-full border border-blue-500/20 bg-blue-500/5 px-3 py-1.5 text-[11px] font-medium text-blue-600 opacity-0 shadow-xs dark:border-blue-400/20 dark:bg-blue-400/5 dark:text-blue-400'
++            className='landing-animate-fade-up mb-5 inline-flex items-center gap-1.5 rounded-full border border-rose-500/20 bg-rose-500/5 px-3 py-1.5 text-[11px] font-medium text-rose-700 opacity-0 shadow-xs dark:border-rose-400/20 dark:bg-rose-400/5 dark:text-rose-300'
+             style={{ animationDelay: '0ms' }}
+           >
+             <span className='relative flex size-1.5'>
+-              <span className='absolute inline-flex h-full w-full animate-ping rounded-full bg-blue-400 opacity-75' />
+-              <span className='relative inline-flex size-1.5 rounded-full bg-blue-500 dark:bg-blue-400' />
++              <span className='absolute inline-flex h-full w-full animate-ping rounded-full bg-rose-400 opacity-75' />
++              <span className='relative inline-flex size-1.5 rounded-full bg-rose-600 dark:bg-rose-400' />
+             </span>
+             <span>{t('AI Application Infrastructure Foundation')}</span>
+           </div>
+ 
+           <h1
+-            className='landing-animate-fade-up text-[clamp(2.25rem,4.5vw,3.25rem)] leading-[1.15] font-bold tracking-tight'
++            className='landing-animate-fade-up text-[2rem] leading-[1.15] font-bold tracking-tight text-balance md:text-5xl lg:text-[3.25rem]'
+             style={{ animationDelay: '60ms' }}
+           >
+             {t('Unified API Gateway for')}
+             <br />
+-            <span className='bg-gradient-to-r from-blue-400 via-violet-400 to-purple-500 bg-clip-text text-transparent'>
++            <span className='bg-gradient-to-r from-rose-600 via-red-600 to-amber-500 bg-clip-text text-transparent'>
+               {t('Vast Range of AI Models')}
+             </span>
+           </h1>
+diff --git a/web/src/features/home/components/sections/stats.tsx b/web/src/features/home/components/sections/stats.tsx
+index c3a5bc1d..2c848d8a 100644
+--- a/web/src/features/home/components/sections/stats.tsx
++++ b/web/src/features/home/components/sections/stats.tsx
+@@ -19,6 +19,8 @@ For commercial licensing, please contact support@quantumnous.com
+ import { useRef, useEffect, useCallback } from 'react'
+ import { useTranslation } from 'react-i18next'
+ 
++import { usePricingData } from '@/features/pricing/hooks/use-pricing-data'
++
+ interface CounterProps {
+   end: number
+   suffix?: string
+@@ -96,18 +98,32 @@ interface StatItem {
+ 
+ export function Stats(_props: StatsProps) {
+   const { t } = useTranslation()
++  const { models, endpointMap } = usePricingData()
++  const billingModes = new Set(
++    models.map((model) => {
++      if (model.quota_type === 0) return 'token'
++      return model.billing_mode === 'per_second' ? 'second' : 'request'
++    })
++  )
+ 
+   const stats: StatItem[] = [
+-    { end: 50, suffix: '+', label: t('upstream services integrated') },
+-    { end: 100, suffix: '+', label: t('model billing support') },
+-    { end: 50, suffix: '+', label: t('compatible API routes') },
+-    { end: 10, suffix: '+', label: t('scheduling controls') },
++    { end: models.length, suffix: '', label: t('Available Models') },
++    {
++      end: Object.keys(endpointMap).length,
++      suffix: '',
++      label: t('compatible API routes'),
++    },
++    {
++      end: billingModes.size,
++      suffix: '',
++      label: t('model billing support'),
++    },
+   ]
+ 
+   return (
+     <div className='border-border/40 bg-muted/10 relative z-10 border-y'>
+       <div className='mx-auto max-w-6xl px-6 py-10 md:py-12'>
+-        <div className='grid grid-cols-2 gap-8 md:grid-cols-4 md:gap-12'>
++        <div className='grid grid-cols-1 gap-6 sm:grid-cols-3 md:gap-12'>
+           {stats.map((s) => (
+             <div
+               key={s.label}
+diff --git a/web/src/features/home/index.tsx b/web/src/features/home/index.tsx
+index c157d352..0045720a 100644
+--- a/web/src/features/home/index.tsx
++++ b/web/src/features/home/index.tsx
+@@ -26,7 +26,14 @@ import { useTheme } from '@/context/theme-provider'
+ import { isLikelyHtml } from '@/lib/content-format'
+ import { useAuthStore } from '@/stores/auth-store'
+ 
+-import { CTA, Features, Hero, HowItWorks, Stats } from './components'
++import {
++  CTA,
++  Features,
++  FeaturedModels,
++  Hero,
++  HowItWorks,
++  Stats,
++} from './components'
+ import { useHomePageContent } from './hooks'
+ 
+ export function Home() {
+@@ -123,6 +130,7 @@ export function Home() {
+   return (
+     <PublicLayout showMainContainer={false}>
+       <Hero isAuthenticated={isAuthenticated} />
++      <FeaturedModels />
+       <Stats />
+       <Features />
+       <HowItWorks />
+diff --git a/web/src/features/home/lib/featured-models.ts b/web/src/features/home/lib/featured-models.ts
+new file mode 100644
+index 00000000..3a463101
+--- /dev/null
++++ b/web/src/features/home/lib/featured-models.ts
+@@ -0,0 +1,43 @@
++/*
++Copyright (C) 2023-2026 QuantumNous
++
++This program is free software: you can redistribute it and/or modify
++it under the terms of the GNU Affero General Public License as
++published by the Free Software Foundation, either version 3 of the
++License, or (at your option) any later version.
++
++This program is distributed in the hope that it will be useful,
++but WITHOUT ANY WARRANTY; without even the implied warranty of
++MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
++GNU Affero General Public License for more details.
++
++You should have received a copy of the GNU Affero General Public License
++along with this program. If not, see <https://www.gnu.org/licenses/>.
++
++For commercial licensing, please contact support@quantumnous.com
++*/
++import type { PricingModel } from '@/features/pricing/types'
++
++const FEATURED_MODEL_NAMES = ['sd-fast-720', 'seedream-5-pro', 'gpt-image-2']
++
++function normalizeModelName(name: string): string {
++  return name.toLowerCase().replaceAll(/[\s_]+/g, '-')
++}
++
++export function selectFeaturedModels(models: PricingModel[]): PricingModel[] {
++  const selected = FEATURED_MODEL_NAMES.flatMap((needle) => {
++    const match = models.find((model) =>
++      normalizeModelName(model.model_name).includes(needle)
++    )
++    return match ? [match] : []
++  })
++
++  for (const model of models) {
++    if (selected.length >= 3) break
++    if (!selected.some((item) => item.model_name === model.model_name)) {
++      selected.push(model)
++    }
++  }
++
++  return selected.slice(0, 3)
++}
+diff --git a/web/src/i18n/locales/zh.json b/web/src/i18n/locales/zh.json
+index e31e6d3c..b9272f5f 100644
+--- a/web/src/i18n/locales/zh.json
++++ b/web/src/i18n/locales/zh.json
+@@ -127,7 +127,7 @@
+     "Accept Unpriced Models": "接受未定价模型",
+     "Accepts a JSON array of model identifiers that support the Imagine API.": "接受支持 Imagine API 的模型标识符的 JSON 数组。",
+     "Accepts comma-separated status codes and inclusive ranges.": "接受逗号分隔的状态码和包含性范围。",
+-    "Access a vast selection of models via a standard, unified API protocol. Power AI applications, manage digital assets, and connect the Future.": "通过统一、标准的接口协议接入海量模型。承载 AI 应用，高效管理数字资产，连接未来。",
++    "Access a vast selection of models via a standard, unified API protocol. Power AI applications, manage digital assets, and connect the Future.": "通过一个 API 入口调用文本、图片与视频模型，并在模型广场查看可用模型和计价方式。",
+     "Access Denied Message": "访问被拒绝消息",
+     "Access Forbidden": "禁止访问",
+     "Access Policy (JSON)": "访问策略 (JSON)",
+@@ -227,7 +227,7 @@
+     "Add Uptime Kuma Group": "添加 Uptime Kuma 分组",
+     "Add User": "添加用户",
+     "Add user group": "添加用户分组",
+-    "Add your API keys, set up channels and configure access permissions": "添加 API 密钥，设置渠道并配置访问权限",
++    "Add your API keys, set up channels and configure access permissions": "创建 API Key，选择模型后即可开始调用。",
+     "Added {{count}} model(s)": "已添加 {{count}} 个模型",
+     "Added successfully": "新增成功",
+     "Additional Conditions": "附加条件",
+@@ -954,7 +954,7 @@
+     "Compare each vendor's token share since launch": "对比自上线以来各厂商的 Token 份额",
+     "Compare the most popular models on the platform": "对比平台上最受欢迎的模型",
+     "compatible API routes": "兼容 API 路由",
+-    "Compatible API routes for common AI application workflows": "兼容常见 AI 应用工作流的 API 路由",
++    "Compatible API routes for common AI application workflows": "通过兼容的 API 接口对接常见 AI 应用。",
+     "Complete API documentation with multi-language SDK support": "完整的 API 文档，支持多语言 SDK",
+     "Complete Order": "补单",
+     "Complete these steps to finish the initial installation.": "完成这些步骤以完成初始安装。",
+@@ -1047,7 +1047,7 @@
+     "Confirmed payment compliance": "确认支付合规",
+     "Conflict": "矛盾",
+     "Connect": "连接",
+-    "Connect through OpenAI, Claude, Gemini, and other compatible API routes": "通过 OpenAI、Claude、Gemini 以及其他兼容 API 路由接入",
++    "Connect through OpenAI, Claude, Gemini, and other compatible API routes": "使用统一接口调用文本、图片与视频模型。",
+     "Connected to io.net service normally.": "已正常连接 io.net 服务。",
+     "Connection closed": "连接已关闭",
+     "Connection error": "连接错误",
+@@ -1368,7 +1368,7 @@
+     "Demo Site Mode": "演示站点模式",
+     "Demote": "降级",
+     "Density": "密度",
+-    "Deploy your own gateway and start routing requests through your configured upstream services.": "部署你自己的网关，并通过已配置的上游服务开始转发请求。",
++    "Deploy your own gateway and start routing requests through your configured upstream services.": "创建账号并获取 API Key，按模型广场展示的接口与价格开始调用。",
+     "Deployment created successfully": "创建部署成功",
+     "Deployment details": "部署详情",
+     "Deployment ID": "部署 ID",
+@@ -1432,7 +1432,7 @@
+     "Discount Rate:": "折扣率：",
+     "Discount ratio for cache hits.": "缓存命中时的折扣比例。",
+     "Discouraged": "不推荐",
+-    "Discover curated AI models, compare pricing and capabilities, and choose the right model for every scenario.": "探索精选 AI 模型，清晰比较价格与能力，为不同场景选择合适的模型。",
++    "Discover curated AI models, compare pricing and capabilities, and choose the right model for every scenario.": "查看当前可用模型、计价方式与调用能力。",
+     "Discover the leading models in each domain": "发掘各个领域的领先模型",
+     "Discover the most-used models and rising vendors on the platform, updated from live usage data.": "探索平台上使用最多的模型和增长中的供应商，数据基于实时用量更新。",
+     "Discover the most-used models, top apps, and rising vendors on the platform — updated continuously across every category.": "发掘平台上最受欢迎的模型、热门应用与崛起的厂商——每个分类的数据持续更新。",
+@@ -3367,7 +3367,7 @@
+     "Path:": "路径：",
+     "Pay": "支付",
+     "Pay with Balance": "使用余额支付",
+-    "Pay-as-you-go with real-time usage monitoring": "按量付费，实时监控使用情况",
++    "Pay-as-you-go with real-time usage monitoring": "按模型计价方式扣费，可在使用日志中核对用量。",
+     "Payment": "支付",
+     "Payment aggregator mode — onboard with your own registered company (offshore entity). Built for Enterprise.": "支付聚合模式：使用你自己的注册公司（离岸实体）入驻。面向企业场景构建。",
+     "Payment Channel": "支付渠道",
+@@ -3715,7 +3715,7 @@
+     "Read channels": "读取渠道",
+     "Ready": "就绪",
+     "Ready to initialize": "准备初始化",
+-    "Ready to simplify": "准备好简化",
++    "Ready to simplify": "现在开始",
+     "Real exchange rate between USD and your payment gateway currency": "美元与您的支付网关货币之间的实际汇率",
+     "Reason": "原因",
+     "Reason:": "原因：",
+@@ -4829,7 +4829,7 @@
+     "Total:": "总计：",
+     "TPM": "TPM",
+     "Track per-request consumption to power usage analytics. Keeping this on increases database writes.": "跟踪每个请求的消耗，以支持使用情况分析。保持开启会增加数据库写入。",
+-    "Track usage, costs and performance with real-time analytics": "通过实时分析跟踪用量、成本和性能",
++    "Track usage, costs and performance with real-time analytics": "在使用日志中查看请求、扣费与任务状态。",
+     "Tracked apps": "已跟踪的应用",
+     "Tracks current account base limits and additional metered usage on Codex upstream.": "跟踪当前账号在 Codex 上游的基础限额与附加计费用量。",
+     "Trading insights, accounting, advisory": "交易洞察、记账与财务建议",
+@@ -4898,7 +4898,7 @@
+     "Understand how user groups, token groups, ratios, and special rules work together.": "了解用户分组、令牌分组、倍率和特殊规则如何共同生效。",
+     "Understand image inputs alongside text": "在文本之外理解图像输入",
+     "Unexpected release payload": "意外的版本数据格式",
+-    "Unified API Gateway for": "统一 API 网关，服务于",
++    "Unified API Gateway for": "一个 API，连接",
+     "Unique identifier for this group.": "此组的唯一标识符。",
+     "Unit price (local currency / USD)": "单价（本地货币 / USD）",
+     "Unit price (USD)": "单价 (USD)",
+@@ -5113,7 +5113,7 @@
+     "Vary": "变换",
+     "Vary (Strong)": "强变换",
+     "Vary (Subtle)": "弱变换",
+-    "Vast Range of AI Models": "海量 AI 模型",
++    "Vast Range of AI Models": "文本、图片与视频模型",
+     "Vendor": "供应商",
+     "Vendor deleted successfully": "供应商删除成功",
+     "Vendor Name *": "供应商名称 *",
+@@ -5313,7 +5313,7 @@
+     "You'll be redirected automatically. You can return to the previous page if nothing happens after a few seconds.": "您将被自动重定向。如果几秒钟后无反应，您可以返回上一页。",
+     "Your account can edit sensitive channel settings.": "你的账号可以编辑敏感渠道设置。",
+     "Your account cannot edit sensitive channel settings.": "你的账号不能编辑敏感渠道设置。",
+-    "your AI integration?": "你的 AI 集成了吗？",
++    "your AI integration?": "调用你的 AI 模型",
+     "Your Azure OpenAI endpoint URL": "您的 Azure OpenAI 端点 URL",
+     "Your Bot Name": "您的机器人名称",
+     "Your Cloudflare Account ID": "您的 Cloudflare 账户 ID",

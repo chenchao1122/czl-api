@@ -1,0 +1,2 @@
+c69d1d2660f13bdfc5c7e546c6ad4387e3c94900bb7242ce6ebe161670027b0d  czl-homepage-qs-integration-source.zip
+b6f07fb584dcd1322c1df924e35337fffa68dcb5bc83f24f7bc5ace07da4082c  czl-homepage-qs-integration.patch
